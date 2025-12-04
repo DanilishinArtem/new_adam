@@ -130,12 +130,13 @@ if __name__ == "__main__":
             hypergrad_lr=1e-5
         )
     else:
-        from lib.new_adam import AdamDynamic
+        # from lib.new_adam import AdamDynamic
+        from lib.learning_adam import AdamDynamic
         optimizer = AdamDynamic(
             model.parameters(),
             lr=1e-3,
             betas=(0.9, 0.999),
-            hyper_lr=(1e-5, 1e-3, 1e-6),
+            hypergrad_lr=1e-5,
         )
     import time
     start = time.time()
