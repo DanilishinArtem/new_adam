@@ -12,14 +12,15 @@ class AdamDynamic(Optimizer):
                  hyper_lr=(1e-8, 1e-8, 1e-8)):
         defaults = dict(lr=lr,betas=betas,eps=eps,weight_decay=weight_decay,hyper_lr=hyper_lr)
         super().__init__(params, defaults)
+        self.writer = None
 
     def step(self, closure=None):
         loss = None
         if closure is not None:
             loss = closure()
         for group in self.param_groups:
-            γ1, γ2, γ3 = group["hyper_lr"]
-            eps = group["eps"]
+            # best results: (0.0, 1e-0, 0.0)
+            gamma_1, gamma_2, gamma_3 = group["hyper_lr"]
 
             for p in group["params"]:
                 if p.grad is None:
@@ -37,23 +38,20 @@ class AdamDynamic(Optimizer):
                     state["m"] = torch.zeros_like(p.data)
                     state["v"] = torch.zeros_like(p.data)
 
-                    β1, β2 = group["betas"]
-                    state["beta1_t"] = β1
-                    state["beta2_t"] = β2
-
-                    state["prod_beta1"] = β1
-                    state["prod_beta2"] = β2
-
-                    state["m_prev"] = torch.zeros_like(p.data)
-                    state["v_prev"] = torch.zeros_like(p.data)
+                    beta1_t, beta2_t = group["betas"]
+                    state["beta1_t"] = beta1_t
+                    state["beta2_t"] = beta2_t
+                    state["prod_beta1"] = beta1_t
+                    state["prod_beta2"] = beta2_t
+                    state["g_prev"] = torch.zeros_like(p.data)
 
                 state["step"] += 1
 
                 m = state["m"]
                 v = state["v"]
 
-                β1_t = state["beta1_t"]
-                β2_t = state["beta2_t"]
+                beta1_t = state["beta1_t"]
+                beta2_t = state["beta2_t"]
 
                 prod_beta1 = state["prod_beta1"]
                 prod_beta2 = state["prod_beta2"]
@@ -61,85 +59,49 @@ class AdamDynamic(Optimizer):
                 if group["weight_decay"] != 0:
                     grad = grad.add(group["weight_decay"], p.data)
 
-                # -------------------------------
-                # bias-corrected моменты
-                # -------------------------------
-                m_hat = m / (1 - prod_beta1)
-                v_hat = v / (1 - prod_beta2)
-
-                # -------------------------------
-                # ОБНОВЛЕНИЕ АЛФЫ (шага)
-                # α_t = α_{t-1} + γ1 g_t m_hat / sqrt(v_hat+eps)
-                # -------------------------------
-                if state["step"] > 2:
-                    update_direction = m_hat / (v_hat.sqrt() + eps)
-                    group["lr"] += γ1 * torch.dot(grad.view(-1), update_direction.view(-1))
-
-                # -------------------------------
-                # ОБНОВЛЕНИЕ β1_t
-                # eq:
-                # β1_t = β1_{t-1} + γ2 * α_t * g_t * d/dβ1(...)
-                # -------------------------------
                 if state["step"] > 1:
-                    # произведение для предыдущего шага
-                    prod_beta1_prev = prod_beta1 / β1_t
-
-                    d_bias = (
-                        (1 - prod_beta1_prev) * (state["m_prev"] - grad) +
-                        m * (prod_beta1_prev / β1_t)
-                    ) / (1 - prod_beta1_prev) ** 2
-
-                    delta_beta1 = γ2 * group["lr"] * torch.dot(grad.view(-1),
-                                                       (d_bias / ((v_hat + eps) ** 0.5)).view(-1))
-                    state["beta1_t"] += delta_beta1
-                    state["beta1_t"] = float(torch.clamp(torch.tensor(state["beta1_t"]), 0.8, 0.9999))
-
-                # -------------------------------
-                # ОБНОВЛЕНИЕ β2_t
-                # eq:
-                # β2_t = β2_{t-1} − γ3 α_t g_t m_hat/(2(v_hat+eps)^{3/2}) * ...
-                # -------------------------------
-                if state["step"] > 1:
-                    prod_beta2_prev = prod_beta2 / β2_t
-
-                    d_bias2 = (
-                        (1 - prod_beta2_prev) * (state["v_prev"] - grad * grad) +
-                        v * (prod_beta2_prev / β2_t)
-                    ) / (1 - prod_beta2_prev) ** 2
-
-                    delta_beta2 = -γ3 * group["lr"] * torch.dot(
-                        grad.view(-1),
-                        (m_hat / (2 * (v_hat + eps) ** 1.5) * d_bias2).view(-1)
-                    )
-                    state["beta2_t"] += delta_beta2
-                    state["beta2_t"] = float(torch.clamp(torch.tensor(state["beta2_t"]), 0.9, 0.99999))
-
-                # -------------------------------
-                # ОБНОВЛЕНИЕ НЕВЗВЕШЕННЫХ МОМЕНТОВ
-                # -------------------------------
-                state["m_prev"] = m.clone()
-                state["v_prev"] = v.clone()
-
-                m.mul_(β1_t).add_(1 - β1_t, grad)
-                v.mul_(β2_t).addcmul_(1 - β2_t, grad, grad)
-                # -------------------------------
-                # ОБНОВЛЕНИЕ ПРОИЗВЕДЕНИЙ БЕТ
-                # -------------------------------
-                prod_beta1 *= β1_t
-                prod_beta2 *= β2_t
-
-                state["prod_beta1"] = prod_beta1
-                state["prod_beta2"] = prod_beta2
+                    # part of alpha calculations ...
+                    prev_bias_correction1 = 1 - prod_beta1
+                    prev_bias_correction2 = 1 - prod_beta2
+                    h = torch.dot(grad.view(-1),torch.div(m,(v.sqrt()+group['eps'])).view(-1))*math.sqrt(prev_bias_correction2)/prev_bias_correction1
+                    
+                    if state["step"] > 2:
+                        # part of beta1_t calculations ...
+                        prod_beta1_prev = prod_beta1 / beta1_t
+                        prod = 1/((v/prev_bias_correction1).sqrt()+group["eps"])
+                        d_bias = ((1/beta1_t)*(m-state["g_prev"])+(state["g_prev"]*prod_beta1_prev))/((1-(prod_beta1*beta1_t))**2)
+                        delta_beta1 = gamma_2*group["lr"]*torch.dot(grad.view(-1),(d_bias*prod).view(-1))
+                        state["beta1_t"] += delta_beta1
+                        state["beta1_t"] = float(torch.clamp(state["beta1_t"], 1e-5, 1.0-1e-5))
+                        
+                        # part of beta2_t calculations ...
+                        prod_beta2_prev = prod_beta2 / beta2_t
+                        prod = (m/prev_bias_correction2)/(2*((v/prev_bias_correction2).sqrt()+group["eps"]))/(((v/prev_bias_correction2).sqrt()+group["eps"]).pow(2))
+                        d_bias2 = ((1/beta2_t)*(v-state["g_prev"]*state["g_prev"])+(state["g_prev"]*state["g_prev"]*prod_beta2_prev))/((1-(prod_beta2*beta2_t))**2)
+                        delta_beta2 = -gamma_3*group["lr"]*torch.dot(grad.view(-1),(d_bias2*prod).view(-1))
+                        state["beta2_t"] += delta_beta2
+                        state["beta2_t"] = float(torch.clamp(state["beta2_t"], 1e-5, 1.0-1e-5))
+                    group['lr'] += gamma_1 * h
+                    group['lr'] = float(torch.clamp(group['lr'], 1e-10, 1e-2))
 
 
-                m_hat = m / (1 - prod_beta1)
-                v_hat = v / (1 - prod_beta2)
-                update_direction = m_hat / (v_hat.sqrt() + eps)
+                state["g_prev"] = grad.clone()
 
-                # -------------------------------
-                # ОБНОВЛЕНИЕ ПАРАМЕТРОВ
-                # θ_t = θ_{t-1} − α_t * m_hat / sqrt(v_hat + eps)
-                # -------------------------------
-                p.data.add_(update_direction, alpha=-group["lr"])
+                state["prod_beta1"] = prod_beta1 * state['beta1_t']
+                state["prod_beta2"] = prod_beta2 * state['beta2_t']
+                beta1_t = state["beta1_t"]
+                beta2_t = state["beta2_t"]
+                prod_beta1 = state["prod_beta1"]
+                prod_beta2 = state["prod_beta2"]
 
+                m.mul_(beta1_t).add_(1 - beta1_t, grad)
+                v.mul_(beta2_t).addcmul_(1 - beta2_t, grad, grad)
+                denom = v.sqrt().add_(group["eps"])
+                step_size = group["lr"] * math.sqrt(1 - prod_beta2) / (1 - prod_beta1)
+                p.data.addcdiv_(-step_size, m, denom)
+
+        if self.writer is not None:
+            self.writer.add_scalar("Train/alpha",   group['lr'], state['step'])
+            self.writer.add_scalar("Train/beta1_t", state['beta1_t'], state['step'])
+            self.writer.add_scalar("Train/beta2_t", state['beta2_t'], state['step'])
         return loss
